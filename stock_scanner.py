@@ -5,13 +5,12 @@ import requests
 from collections import Counter
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import google.generativeai as genai
 
 # ── Keys pulled from GitHub Secrets ──────────────────────────────────────────
-GEMINI_API_KEY    = os.environ['GEMINI_API_KEY']
-GMAIL_ADDRESS     = os.environ['GMAIL_ADDRESS']
+GEMINI_API_KEY     = os.environ['GEMINI_API_KEY']
+GMAIL_ADDRESS      = os.environ['GMAIL_ADDRESS']
 GMAIL_APP_PASSWORD = os.environ['GMAIL_APP_PASSWORD']
-EMAIL_RECIPIENT   = os.environ['EMAIL_RECIPIENT']
+EMAIL_RECIPIENT    = os.environ['EMAIL_RECIPIENT']
 
 # ── Subreddits to monitor ─────────────────────────────────────────────────────
 SUBREDDITS = [
@@ -29,11 +28,14 @@ EXCLUDE = {
     'FROM','THEY','WHAT','WHEN','WILL','WITH','BEEN','HAVE','WERE','SAID',
     'SHE','HIM','WHO','OWN','OUT','DAY','WAY','MAY','DID','LET','PUT','SET',
     'USE','FED','SEC','TAX','OIL','GAS','CAR','EV','PE','VC','YTD','YOY',
-    'TTM','FCF','PO','RH','ML','DL','IMO','TBH','TBF','YOLO','FOMO','TLDR',
-    'EDIT','LMAO','HODL','BUY','SELL','HOLD','CALL','PUTS','CALL','LOSS',
-    'GAIN','MOON','BEAR','BULL','FUND','FUND','CASH','DEBT','RISK','HIGH',
-    'LOW','MID','CAP','BID','ASK','IV','OTM','ITM','ATM','DTE','PNL',
-    'FOMC','CPI','PCE','NFP','OPEX','RATE','BOND','NOTE','BILL','REPO'
+    'TTM','FCF','PO','RH','ML','DL','TBH','YOLO','FOMO','TLDR','EDIT',
+    'LMAO','HODL','BUY','SELL','HOLD','CALL','PUTS','LOSS','GAIN','MOON',
+    'BEAR','BULL','FUND','CASH','DEBT','RISK','HIGH','LOW','MID','CAP',
+    'BID','ASK','IV','OTM','ITM','ATM','DTE','PNL','FOMC','CPI','PCE',
+    'NFP','OPEX','RATE','BOND','NOTE','BILL','REPO','ROI','NET','NEXT',
+    'LAST','JUST','LIKE','GOOD','REAL','SOME','MAKE','MUCH','EVEN',
+    'ALSO','BACK','INTO','MORE','THAN','THEN','THEM','TIME','VERY','YOUR',
+    'LONG','PLAY','WEEK','YEAR','OVER','WANT','NEED','TAKE','OPEN','ONLY'
 }
 
 # ── Fetch posts from a subreddit ──────────────────────────────────────────────
@@ -44,7 +46,10 @@ def fetch_reddit(subreddit):
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
             posts = r.json()['data']['children']
-            return [f"{p['data'].get('title','')} {p['data'].get('selftext','')}" for p in posts]
+            return [
+                f"{p['data'].get('title','')} {p['data'].get('selftext','')}"
+                for p in posts
+            ]
     except Exception as e:
         print(f"Reddit error ({subreddit}): {e}")
     return []
@@ -55,10 +60,11 @@ def fetch_finviz():
     try:
         r = requests.get("https://finviz.com/news.ashx", headers=headers, timeout=10)
         return re.findall(r'\$([A-Z]{1,5})\b', r.text)
-    except:
-        return []
+    except Exception as e:
+        print(f"Finviz error: {e}")
+    return []
 
-# ── Pull tickers from text ────────────────────────────────────────────────────
+# ── Extract tickers from text ─────────────────────────────────────────────────
 def extract_tickers(texts):
     pattern = re.compile(r'\$([A-Z]{2,5})\b|\b([A-Z]{2,5})\b')
     tickers = []
@@ -73,29 +79,34 @@ def extract_tickers(texts):
 def score_tickers(tickers):
     return Counter(tickers).most_common(15)
 
-# ── Call Gemini to write the report ──────────────────────────────────────────
+# ── Call Gemini directly via HTTP (no extra library needed) ───────────────────
 def generate_report(top_tickers):
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-
     ticker_summary = ', '.join([f"{t} ({c} mentions)" for t, c in top_tickers])
 
     prompt = f"""You are a sharp options trading analyst. Reddit and Finviz social chatter from this morning shows the following tickers trending by mention volume:
 
 {ticker_summary}
 
-Your job: pick the TOP 3 most interesting candidates for options trading today or this week. Base your selection on mention velocity, any likely catalyst (earnings, short squeeze narrative, news, sector momentum), and options relevance.
+Pick the TOP 3 most interesting candidates for options trading today or this week. Base your selection on mention velocity, any likely catalyst (earnings, short squeeze narrative, news, sector momentum), and options relevance.
 
 For each of the 3 picks write:
-- Ticker & why it's trending
+- Ticker and why it is trending
 - Most likely catalyst
 - Options angle: calls or puts, near-term or weekly expiry consideration
 - Key risk to watch
 
-Write this as a clean, punchy morning briefing. No fluff. Be direct and actionable."""
+Write this as a clean punchy morning briefing. No fluff. Be direct and actionable."""
 
-    response = model.generate_content(prompt)
-    return response.text
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    response = requests.post(url, json=payload, timeout=30)
+    response.raise_for_status()
+    result = response.json()
+    return result['candidates'][0]['content']['parts'][0]['text']
 
 # ── Send the report via Gmail ─────────────────────────────────────────────────
 def send_email(report_text):
@@ -130,7 +141,7 @@ def main():
     top = score_tickers(all_tickers)
     print(f"Top tickers: {top}")
 
-    print("Generating report...")
+    print("Generating report with Gemini...")
     report = generate_report(top)
 
     print("Sending email...")
