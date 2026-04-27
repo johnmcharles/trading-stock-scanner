@@ -9,7 +9,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # ── Keys pulled from GitHub Secrets ──────────────────────────────────────────
-GEMINI_API_KEY     = os.environ['GEMINI_API_KEY']
+ANTHROPIC_API_KEY  = os.environ['ANTHROPIC_API_KEY']
 GMAIL_ADDRESS      = os.environ['GMAIL_ADDRESS']
 GMAIL_APP_PASSWORD = os.environ['GMAIL_APP_PASSWORD']
 EMAIL_RECIPIENT    = os.environ['EMAIL_RECIPIENT']
@@ -114,7 +114,7 @@ def extract_tickers(texts):
 def score_tickers(tickers):
     return Counter(tickers).most_common(15)
 
-# ── Call Gemini directly via HTTP ─────────────────────────────────────────────
+# ── Call Claude API to generate report ───────────────────────────────────────
 def generate_report(top_tickers):
     ticker_summary = ', '.join([f"{t} ({c} mentions)" for t, c in top_tickers])
 
@@ -132,28 +132,35 @@ For each of the 3 picks write:
 
 Write this as a clean punchy morning briefing. No fluff. Be direct and actionable."""
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    )
+    url = "https://api.anthropic.com/v1/messages"
 
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    }
 
-    time.sleep(5)
+    api_headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
 
     for attempt in range(3):
         try:
-            response = requests.post(url, json=payload, headers=HEADERS, timeout=30)
-            print(f"  Gemini HTTP status: {response.status_code}")
-            print(f"  Gemini response body: {response.text[:500]}")
+            response = requests.post(url, json=payload, headers=api_headers, timeout=30)
+            print(f"  Claude HTTP status: {response.status_code}")
             response.raise_for_status()
             result = response.json()
-            return result['candidates'][0]['content']['parts'][0]['text']
+            return result['content'][0]['text']
         except Exception as e:
-            print(f"  Gemini attempt {attempt+1} failed: {e}")
-            time.sleep(10)
+            print(f"  Claude attempt {attempt+1} failed: {e}")
+            print(f"  Response body: {response.text[:300]}")
+            time.sleep(5)
 
-    return "Report generation failed — check Gemini API key and quota."
+    return "Report generation failed."
 
 # ── Send the report via Gmail ─────────────────────────────────────────────────
 def send_email(report_text):
@@ -193,7 +200,7 @@ def main():
     top = score_tickers(all_tickers)
     print(f"Top tickers: {top}")
 
-    print("Generating report with Gemini...")
+    print("Generating report with Claude...")
     report = generate_report(top)
     print(report)
 
