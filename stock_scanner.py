@@ -150,6 +150,10 @@ Write this as a clean punchy morning briefing. No fluff. Be direct and actionabl
             return result['candidates'][0]['content']['parts'][0]['text']
         except Exception as e:
             print(f"  Gemini attempt {attempt+1} failed: {e}")
+            try:
+                    print(f"  Response body: {response.text}")
+                except:
+                    pass
             time.sleep(10)
 
     return "Report generation failed — check Gemini API key and quota."
