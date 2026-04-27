@@ -1,7 +1,9 @@
 import os
 import re
+import time
 import smtplib
 import requests
+import xml.etree.ElementTree as ET
 from collections import Counter
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -12,7 +14,7 @@ GMAIL_ADDRESS      = os.environ['GMAIL_ADDRESS']
 GMAIL_APP_PASSWORD = os.environ['GMAIL_APP_PASSWORD']
 EMAIL_RECIPIENT    = os.environ['EMAIL_RECIPIENT']
 
-# ── Subreddits to monitor ─────────────────────────────────────────────────────
+# ── Subreddits to monitor via RSS ─────────────────────────────────────────────
 SUBREDDITS = [
     'wallstreetbets', 'options', 'stocks',
     'pennystocks', 'Daytrading', 'investing'
@@ -35,33 +37,66 @@ EXCLUDE = {
     'NFP','OPEX','RATE','BOND','NOTE','BILL','REPO','ROI','NET','NEXT',
     'LAST','JUST','LIKE','GOOD','REAL','SOME','MAKE','MUCH','EVEN',
     'ALSO','BACK','INTO','MORE','THAN','THEN','THEM','TIME','VERY','YOUR',
-    'LONG','PLAY','WEEK','YEAR','OVER','WANT','NEED','TAKE','OPEN','ONLY'
+    'LONG','PLAY','WEEK','YEAR','OVER','WANT','NEED','TAKE','OPEN','ONLY',
+    'SAYS','SAID','SHOW','LOOK','FEEL','TOLD','WENT','COME','CAME','KEEP',
+    'PULL','PUSH','MOVE','RISE','FALL','DROP','PUMP','DUMP','TANK','RIPS',
+    'DOWN','HITS','TOPS','ADDS','CUTS','SEES','HITS','SETS','WINS','LOSS'
 }
 
-# ── Fetch posts from a subreddit ──────────────────────────────────────────────
-def fetch_reddit(subreddit):
-    url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit=100"
-    headers = {'User-Agent': 'Mozilla/5.0 StockScanner/1.0'}
+HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/120.0.0.0 Safari/537.36'
+    )
+}
+
+# ── Fetch Reddit via RSS (bypasses cloud IP blocks) ───────────────────────────
+def fetch_reddit_rss(subreddit):
+    url = f"https://www.reddit.com/r/{subreddit}/hot.rss?limit=50"
     try:
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code == 200:
-            posts = r.json()['data']['children']
-            return [
-                f"{p['data'].get('title','')} {p['data'].get('selftext','')}"
-                for p in posts
-            ]
+            root = ET.fromstring(r.content)
+            ns = {'atom': 'http://www.w3.org/2005/Atom'}
+            entries = root.findall('atom:entry', ns)
+            texts = []
+            for entry in entries:
+                title = entry.find('atom:title', ns)
+                content = entry.find('atom:content', ns)
+                t = title.text if title is not None else ''
+                c = content.text if content is not None else ''
+                texts.append(f"{t} {c}")
+            print(f"  r/{subreddit}: {len(texts)} posts via RSS")
+            return texts
+        else:
+            print(f"  r/{subreddit}: HTTP {r.status_code}")
     except Exception as e:
-        print(f"Reddit error ({subreddit}): {e}")
+        print(f"  r/{subreddit} RSS error: {e}")
     return []
 
-# ── Scrape trending tickers from Finviz news ──────────────────────────────────
-def fetch_finviz():
-    headers = {'User-Agent': 'Mozilla/5.0 StockScanner/1.0'}
+# ── Fetch Yahoo Finance trending tickers ──────────────────────────────────────
+def fetch_yahoo_trending():
+    url = "https://finance.yahoo.com/trending-tickers/"
     try:
-        r = requests.get("https://finviz.com/news.ashx", headers=headers, timeout=10)
-        return re.findall(r'\$([A-Z]{1,5})\b', r.text)
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        tickers = re.findall(r'"symbol":"([A-Z]{1,5})"', r.text)
+        unique = list(dict.fromkeys(tickers))[:30]
+        print(f"  Yahoo trending: {len(unique)} tickers")
+        return unique
     except Exception as e:
-        print(f"Finviz error: {e}")
+        print(f"  Yahoo error: {e}")
+    return []
+
+# ── Fetch Finviz news tickers ─────────────────────────────────────────────────
+def fetch_finviz():
+    try:
+        r = requests.get("https://finviz.com/news.ashx", headers=HEADERS, timeout=15)
+        tickers = re.findall(r'\$([A-Z]{1,5})\b', r.text)
+        print(f"  Finviz: {len(tickers)} ticker mentions")
+        return tickers
+    except Exception as e:
+        print(f"  Finviz error: {e}")
     return []
 
 # ── Extract tickers from text ─────────────────────────────────────────────────
@@ -79,11 +114,11 @@ def extract_tickers(texts):
 def score_tickers(tickers):
     return Counter(tickers).most_common(15)
 
-# ── Call Gemini directly via HTTP (no extra library needed) ───────────────────
+# ── Call Gemini directly via HTTP ─────────────────────────────────────────────
 def generate_report(top_tickers):
     ticker_summary = ', '.join([f"{t} ({c} mentions)" for t, c in top_tickers])
 
-    prompt = f"""You are a sharp options trading analyst. Reddit and Finviz social chatter from this morning shows the following tickers trending by mention volume:
+    prompt = f"""You are a sharp options trading analyst. Reddit and financial site social chatter from this morning shows the following tickers trending by mention volume:
 
 {ticker_summary}
 
@@ -103,10 +138,21 @@ Write this as a clean punchy morning briefing. No fluff. Be direct and actionabl
     )
 
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    response = requests.post(url, json=payload, timeout=30)
-    response.raise_for_status()
-    result = response.json()
-    return result['candidates'][0]['content']['parts'][0]['text']
+
+    # Pause briefly to avoid rate limit on free tier
+    time.sleep(5)
+
+    for attempt in range(3):
+        try:
+            response = requests.post(url, json=payload, headers=HEADERS, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            return result['candidates'][0]['content']['parts'][0]['text']
+        except Exception as e:
+            print(f"  Gemini attempt {attempt+1} failed: {e}")
+            time.sleep(10)
+
+    return "Report generation failed — check Gemini API key and quota."
 
 # ── Send the report via Gmail ─────────────────────────────────────────────────
 def send_email(report_text):
@@ -125,14 +171,19 @@ def send_email(report_text):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    print("Fetching Reddit posts...")
+    print("Fetching Reddit posts via RSS...")
     all_texts = []
     for sub in SUBREDDITS:
-        posts = fetch_reddit(sub)
+        posts = fetch_reddit_rss(sub)
         all_texts.extend(posts)
-        print(f"  r/{sub}: {len(posts)} posts")
+        time.sleep(2)  # polite delay between subreddit requests
 
     all_tickers = extract_tickers(all_texts)
+    print(f"Reddit ticker mentions: {len(all_tickers)}")
+
+    print("Fetching Yahoo Finance trending...")
+    yahoo_tickers = fetch_yahoo_trending()
+    all_tickers += yahoo_tickers * 3  # weight Yahoo tickers (already curated)
 
     print("Fetching Finviz tickers...")
     all_tickers += fetch_finviz()
@@ -143,6 +194,7 @@ def main():
 
     print("Generating report with Gemini...")
     report = generate_report(top)
+    print(report)
 
     print("Sending email...")
     send_email(report)
