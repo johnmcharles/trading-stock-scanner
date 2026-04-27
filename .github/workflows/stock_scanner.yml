@@ -2,11 +2,11 @@ name: Morning Stock Scanner
 
 on:
   schedule:
-    # Runs at 12:30 UTC = 8:30 AM EDT (March–November)
-    # Change to 13:30 UTC in winter months (November–March) to keep 8:30 AM EST
-    - cron: '30 12 * * 1-5'   # Monday–Friday only
+    # 12:30 UTC = 8:30 AM EDT (March-November)
+    # Change to 13:30 UTC in winter (November-March) for 8:30 AM EST
+    - cron: '30 12 * * 1-5'
 
-  workflow_dispatch:   # lets you trigger it manually for testing
+  workflow_dispatch:
 
 jobs:
   run-scanner:
@@ -14,16 +14,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install requests google-generativeai
+        run: pip install requests
 
       - name: Run stock scanner
         env:
@@ -31,5 +30,4 @@ jobs:
           GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_RECIPIENT:    ${{ secrets.EMAIL_RECIPIENT }}
-        run: |
-          python stock_scanner.py
+        run: python stock_scanner.py
