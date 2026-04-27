@@ -40,7 +40,7 @@ EXCLUDE = {
     'LONG','PLAY','WEEK','YEAR','OVER','WANT','NEED','TAKE','OPEN','ONLY',
     'SAYS','SAID','SHOW','LOOK','FEEL','TOLD','WENT','COME','CAME','KEEP',
     'PULL','PUSH','MOVE','RISE','FALL','DROP','PUMP','DUMP','TANK','RIPS',
-    'DOWN','HITS','TOPS','ADDS','CUTS','SEES','HITS','SETS','WINS','LOSS'
+    'DOWN','HITS','TOPS','ADDS','CUTS','SEES','SETS','WINS'
 }
 
 HEADERS = {
@@ -51,7 +51,7 @@ HEADERS = {
     )
 }
 
-# ── Fetch Reddit via RSS (bypasses cloud IP blocks) ───────────────────────────
+# ── Fetch Reddit via RSS ──────────────────────────────────────────────────────
 def fetch_reddit_rss(subreddit):
     url = f"https://www.reddit.com/r/{subreddit}/hot.rss?limit=50"
     try:
@@ -139,21 +139,18 @@ Write this as a clean punchy morning briefing. No fluff. Be direct and actionabl
 
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
-    # Pause briefly to avoid rate limit on free tier
     time.sleep(5)
 
     for attempt in range(3):
         try:
             response = requests.post(url, json=payload, headers=HEADERS, timeout=30)
+            print(f"  Gemini HTTP status: {response.status_code}")
+            print(f"  Gemini response body: {response.text[:500]}")
             response.raise_for_status()
             result = response.json()
             return result['candidates'][0]['content']['parts'][0]['text']
         except Exception as e:
             print(f"  Gemini attempt {attempt+1} failed: {e}")
-            try:
-                    print(f"  Response body: {response.text}")
-                except:
-                    pass
             time.sleep(10)
 
     return "Report generation failed — check Gemini API key and quota."
@@ -180,14 +177,14 @@ def main():
     for sub in SUBREDDITS:
         posts = fetch_reddit_rss(sub)
         all_texts.extend(posts)
-        time.sleep(2)  # polite delay between subreddit requests
+        time.sleep(2)
 
     all_tickers = extract_tickers(all_texts)
     print(f"Reddit ticker mentions: {len(all_tickers)}")
 
     print("Fetching Yahoo Finance trending...")
     yahoo_tickers = fetch_yahoo_trending()
-    all_tickers += yahoo_tickers * 3  # weight Yahoo tickers (already curated)
+    all_tickers += yahoo_tickers * 3
 
     print("Fetching Finviz tickers...")
     all_tickers += fetch_finviz()
