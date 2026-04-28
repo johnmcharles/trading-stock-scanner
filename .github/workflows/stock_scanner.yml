@@ -22,7 +22,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests gspread google-auth
 
       - name: Run stock scanner
         env:
@@ -30,4 +30,6 @@ jobs:
           GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_RECIPIENT:    ${{ secrets.EMAIL_RECIPIENT }}
+          SHEETS_ID:          ${{ secrets.SHEETS_ID }}
+          SHEETS_CREDENTIALS: ${{ secrets.SHEETS_CREDENTIALS }}
         run: python stock_scanner.py
