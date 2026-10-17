@@ -2,9 +2,9 @@ name: Morning Stock Scanner
 
 on:
   schedule:
-    # 13:30 UTC = 8:30 AM EST (November-March)
-    # Change to 12:30 UTC in summer (March-November) for 8:30 AM EDT
-    - cron: '30 13 * * 1-5'
+    # 12:30 UTC = 8:30 AM EDT (March-November)
+    # Change to 13:30 UTC in winter (November-March) for 8:30 AM EST
+    - cron: '30 12 * * 1-5'
 
   workflow_dispatch:
 
