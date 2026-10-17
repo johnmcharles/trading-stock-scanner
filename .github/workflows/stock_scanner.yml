@@ -35,6 +35,7 @@ jobs:
           EMAIL_RECIPIENT:    ${{ secrets.EMAIL_RECIPIENT }}
           SHEETS_ID:          ${{ secrets.SHEETS_ID }}
           SHEETS_CREDENTIALS: ${{ secrets.SHEETS_CREDENTIALS }}
+          RESEND_API_KEY:     ${{ secrets.RESEND_API_KEY }}
         run: python stock_scanner.py
 
       - name: Keep repository active (prevent 60-day auto-disable)

@@ -22,6 +22,12 @@ EMAIL_RECIPIENT    = os.environ['EMAIL_RECIPIENT']
 SHEETS_ID          = os.environ['SHEETS_ID']
 SHEETS_CREDENTIALS = os.environ['SHEETS_CREDENTIALS']
 
+# Optional: when RESEND_API_KEY is set as a secret, mail is sent through
+# Resend from a Maineblock address instead of Gmail SMTP, so the briefing
+# never touches the Gmail account at all. EMAIL_FROM can override the sender.
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
+EMAIL_FROM     = os.environ.get('EMAIL_FROM', 'Maineblock Briefing <hello@maineblock.com>')
+
 # Set SCANNER_DRY_RUN=1 to build the report without emailing or logging it.
 DRY_RUN = os.environ.get('SCANNER_DRY_RUN', '') == '1'
 
@@ -805,10 +811,36 @@ def log_to_sheets(top_tickers, report_text):
     except Exception as e:
         print(f"  Sheets error: {e}")
 
-# ── Send the report via Gmail ─────────────────────────────────────────────────
+# ── Send the report ───────────────────────────────────────────────────────────
+# Preferred path: Resend from a generic Maineblock address (no Gmail involved
+# on either side). Fallback: the original Gmail SMTP path, used only while no
+# RESEND_API_KEY secret exists, so adding the secret is all it takes to switch.
 def send_email(html_content, plain_text):
+    subject = f"📊 Stock Chatter Report — {date.today().strftime('%b %d')}"
+    domain = EMAIL_RECIPIENT.rsplit('@', 1)[-1] if '@' in EMAIL_RECIPIENT else '?'
+
+    if RESEND_API_KEY:
+        r = requests.post(
+            'https://api.resend.com/emails',
+            headers={
+                'Authorization': f'Bearer {RESEND_API_KEY}',
+                'Content-Type': 'application/json',
+            },
+            json={
+                'from': EMAIL_FROM,
+                'to': [EMAIL_RECIPIENT],
+                'subject': subject,
+                'html': html_content,
+                'text': plain_text,
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        print(f"  Email sent via Resend from {EMAIL_FROM} to ***@{domain}.")
+        return
+
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"📊 Stock Chatter Report — {date.today().strftime('%b %d')}"
+    msg['Subject'] = subject
     msg['From']    = GMAIL_ADDRESS
     msg['To']      = EMAIL_RECIPIENT
 
@@ -819,7 +851,7 @@ def send_email(html_content, plain_text):
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_ADDRESS, EMAIL_RECIPIENT, msg.as_string())
 
-    print("  Email sent.")
+    print(f"  Email sent via Gmail SMTP to ***@{domain}.")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
