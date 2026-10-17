@@ -1,8 +1,9 @@
 import os
 import re
+import io
+import csv
 import time
 import json
-import base64
 import smtplib
 import requests
 import xml.etree.ElementTree as ET
@@ -20,6 +21,9 @@ GMAIL_APP_PASSWORD = os.environ['GMAIL_APP_PASSWORD']
 EMAIL_RECIPIENT    = os.environ['EMAIL_RECIPIENT']
 SHEETS_ID          = os.environ['SHEETS_ID']
 SHEETS_CREDENTIALS = os.environ['SHEETS_CREDENTIALS']
+
+# Set SCANNER_DRY_RUN=1 to build the report without emailing or logging it.
+DRY_RUN = os.environ.get('SCANNER_DRY_RUN', '') == '1'
 
 # ── Subreddits to monitor via RSS ─────────────────────────────────────────────
 SUBREDDITS = [
@@ -77,6 +81,124 @@ HEADERS = {
         'Chrome/120.0.0.0 Safari/537.36'
     )
 }
+SEC_HEADERS = {
+    'User-Agent': 'Maineblock morning scanner (admin@maineblock.com)'
+}
+
+MAX_MARKET_CAP = 500_000_000_000
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Real-symbol universe: the validation gate that keeps fake tickers out.
+# Built each run from the official exchange listings (Nasdaq Trader symbol
+# directory) with the SEC's listed-companies file as a second source. A
+# candidate symbol must resolve against this universe, or, if it arrived as a
+# deliberate $cashtag, pass a live Yahoo price check before it can appear.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _symbol_key(symbol):
+    """Lookup key: class-share separators removed (BRK/B, BRK.B, BRK-B -> BRKB)."""
+    return re.sub(r'[^A-Z0-9]', '', symbol.upper())
+
+def _display_symbol(symbol):
+    return symbol.upper().replace('/', '.').replace('-', '.')
+
+def _yahoo_symbol(symbol):
+    return symbol.upper().replace('/', '-').replace('.', '-')
+
+def load_universe():
+    """Returns {key: {'symbol', 'name', 'is_etf'}} for US-listed stocks/ETFs.
+    Test issues are excluded. Sources merge; Nasdaq Trader entries win because
+    they carry the ETF and test-issue flags."""
+    universe = {}
+
+    def add(symbol, name, is_etf):
+        key = _symbol_key(symbol)
+        if not key or key in EXCLUDE:
+            return
+        if key not in universe or universe[key]['is_etf'] is None:
+            universe[key] = {
+                'symbol': _display_symbol(symbol),
+                'name': (name or '').strip(),
+                'is_etf': is_etf,
+            }
+
+    # Source 1: Nasdaq Trader symbol directory (Nasdaq-listed + other-listed).
+    for url, sym_col, etf_col, test_col in (
+        ('https://www.nasdaqtrader.com/dynamic/symbols/nasdaqlisted.txt',
+         'Symbol', 'ETF', 'Test Issue'),
+        ('https://www.nasdaqtrader.com/dynamic/symbols/otherlisted.txt',
+         'ACT Symbol', 'ETF', 'Test Issue'),
+    ):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=25)
+            r.raise_for_status()
+            rows = list(csv.DictReader(io.StringIO(r.text), delimiter='|'))
+            kept = 0
+            for row in rows:
+                sym = (row.get(sym_col) or '').strip()
+                if not sym or (row.get(test_col) or '').strip() == 'Y':
+                    continue
+                add(sym, row.get('Security Name', ''),
+                    (row.get(etf_col) or '').strip() == 'Y')
+                kept += 1
+            print(f"  Universe {url.rsplit('/', 1)[-1]}: {kept} symbols")
+        except Exception as e:
+            print(f"  Universe source failed ({url.rsplit('/', 1)[-1]}): {e}")
+
+    # Source 2: SEC listed companies (equities and many ETFs; no ETF flag).
+    try:
+        r = requests.get('https://www.sec.gov/files/company_tickers_exchange.json',
+                         headers=SEC_HEADERS, timeout=25)
+        r.raise_for_status()
+        fields = r.json()['fields']
+        ti, ni = fields.index('ticker'), fields.index('name')
+        kept = 0
+        for row in r.json()['data']:
+            add(row[ti], row[ni], None)
+            kept += 1
+        print(f"  Universe SEC exchange file: {kept} rows merged")
+    except Exception as e:
+        print(f"  Universe SEC source failed: {e}")
+
+    print(f"  Universe total: {len(universe)} real symbols")
+    return universe
+
+# Suffixes chatter glues onto tickers ("ASMLEARNINGS" = ASML + EARNINGS).
+_GLUE_SUFFIXES = {
+    'EARNINGS', 'CALLS', 'PUTS', 'CALL', 'PUT', 'STOCK', 'SHARES', 'OPTIONS',
+    'LEARNINGS', 'YOLO', 'MOON', 'GAINS', 'LOSS', 'DD', 'PLAY', 'PLAYS',
+    'TOMORROW', 'TODAY', 'WEEK', 'GUYS', 'NEWS', 'RUN', 'DIP', 'TOP', 'CEO',
+}
+
+def resolve_token(token, cashtag, universe):
+    """Map a raw candidate token to a real symbol.
+    Returns (symbol, how) with how in {'listed', 'normalized', 'unverified'},
+    or None when the token cannot be tied to a real, tradable symbol.
+    - listed:     the token is a real exchange-listed symbol.
+    - normalized: a glued token whose prefix is a real symbol and whose tail
+                  is known chatter glue (ASMLEARNINGS -> ASML).
+    - unverified: not in the listings (possible coverage gap), but written as
+                  a deliberate $cashtag; admitted only if Yahoo later returns
+                  a live price for it. Bare words never get this path.
+    """
+    if not token or token in EXCLUDE:
+        return None
+    key = _symbol_key(token)
+    if key in universe:
+        return universe[key]['symbol'], 'listed'
+    if len(key) >= 6:
+        for plen in (5, 4, 3):
+            prefix, tail = key[:plen], key[plen:]
+            if prefix not in universe or len(tail) < 3 or not tail.isalpha():
+                continue
+            # A $cashtag is a deliberate ticker reference, so any glued tail
+            # is chatter noise. A bare word must end in a known glue suffix,
+            # so ordinary long words (CARPOOL -> CAR) are not misread.
+            if cashtag or tail in _GLUE_SUFFIXES:
+                return universe[prefix]['symbol'], 'normalized'
+    if cashtag and 1 <= len(key) <= 6:
+        return _display_symbol(token), 'unverified'
+    return None
 
 # ── Fetch Reddit via RSS ──────────────────────────────────────────────────────
 def fetch_reddit_rss(subreddit):
@@ -103,33 +225,44 @@ def fetch_reddit_rss(subreddit):
     return []
 
 # ── Fetch Yahoo Finance trending tickers ──────────────────────────────────────
-def fetch_yahoo_trending():
+def fetch_yahoo_trending(universe):
     try:
         r = requests.get(
             "https://finance.yahoo.com/trending-tickers/",
             headers=HEADERS, timeout=15
         )
-        tickers = re.findall(r'"symbol":"([A-Z]{1,5})"', r.text)
-        unique = [t for t in list(dict.fromkeys(tickers))[:30] if t not in EXCLUDE]
-        print(f"  Yahoo trending: {len(unique)} tickers")
+        found = re.findall(r'"symbol":"([A-Z]{1,5})"', r.text)
+        unique = []
+        for t in dict.fromkeys(found):
+            resolved = resolve_token(t, True, universe)
+            if resolved:
+                unique.append(resolved[0])
+        unique = list(dict.fromkeys(unique))[:30]
+        print(f"  Yahoo trending: {len(unique)} validated tickers")
         return unique
     except Exception as e:
         print(f"  Yahoo error: {e}")
     return []
 
 # ── Fetch Finviz news tickers ─────────────────────────────────────────────────
-def fetch_finviz():
+def fetch_finviz(universe):
     try:
         r = requests.get("https://finviz.com/news.ashx", headers=HEADERS, timeout=15)
-        tickers = [t for t in re.findall(r'\$([A-Z]{1,5})\b', r.text) if t not in EXCLUDE]
-        print(f"  Finviz: {len(tickers)} ticker mentions")
+        raw = re.findall(r'\$([A-Z]{1,5})\b', r.text)
+        tickers = []
+        for t in raw:
+            resolved = resolve_token(t, True, universe)
+            if resolved:
+                tickers.append(resolved[0])
+        print(f"  Finviz: {len(tickers)} validated ticker mentions "
+              f"({len(raw)} raw)")
         return tickers
     except Exception as e:
         print(f"  Finviz error: {e}")
     return []
 
 # ── Fetch earnings calendar from Nasdaq ───────────────────────────────────────
-def fetch_earnings_this_week():
+def fetch_earnings_this_week(universe):
     try:
         today = date.today().strftime('%Y-%m-%d')
         url = f"https://api.nasdaq.com/api/calendar/earnings?date={today}"
@@ -138,41 +271,41 @@ def fetch_earnings_this_week():
         tickers = []
         rows = data.get('data', {}).get('rows', []) or []
         for row in rows[:50]:
-            symbol = row.get('symbol', '').strip().upper()
-            if symbol and symbol not in EXCLUDE:
-                tickers.append(symbol)
+            symbol = (row.get('symbol', '') or '').strip().upper()
+            resolved = resolve_token(symbol, True, universe) if symbol else None
+            if resolved:
+                tickers.append(resolved[0])
         print(f"  Earnings today: {tickers}")
         return tickers
     except Exception as e:
         print(f"  Earnings calendar error: {e}")
     return []
 
-# ── Get market cap from Yahoo Finance ─────────────────────────────────────────
-def get_market_cap(ticker):
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        data = r.json()
-        meta = data.get('chart', {}).get('result', [{}])[0].get('meta', {})
-        market_cap = meta.get('marketCap', 0)
-        return market_cap
-    except:
-        return 0
+# ── Extract tickers and sentiment from text, validated against the universe ──
+_TOKEN_RE = re.compile(r'\$([A-Z]{1,12}(?:\.[A-Z])?)\b|\b([A-Z]{2,12}(?:\.[A-Z])?)\b')
 
-# ── Extract tickers and sentiment from text ───────────────────────────────────
-def extract_tickers_with_sentiment(texts):
-    pattern = re.compile(r'\$([A-Z]{2,5})\b|\b([A-Z]{2,5})\b')
+def extract_tickers_with_sentiment(texts, universe):
     ticker_mentions = defaultdict(int)
     ticker_sentiment = defaultdict(int)
+    stats = {'listed': 0, 'normalized': 0, 'unverified': 0, 'dropped': 0}
+    normalized_seen = {}
 
     for text in texts:
         text_lower = text.lower()
         found_in_text = set()
-        for match in pattern.findall(text):
-            ticker = match[0] or match[1]
-            if ticker and ticker not in EXCLUDE and len(ticker) >= 2:
-                ticker_mentions[ticker] += 1
-                found_in_text.add(ticker)
+        for match in _TOKEN_RE.finditer(text):
+            cashtag = match.group(1) is not None
+            token = match.group(1) or match.group(2)
+            resolved = resolve_token(token, cashtag, universe)
+            if resolved is None:
+                stats['dropped'] += 1
+                continue
+            symbol, how = resolved
+            stats[how] += 1
+            if how == 'normalized':
+                normalized_seen[token] = symbol
+            ticker_mentions[symbol] += 1
+            found_in_text.add(symbol)
 
         bull_score = sum(1 for w in BULLISH_WORDS if w in text_lower)
         bear_score = sum(1 for w in BEARISH_WORDS if w in text_lower)
@@ -181,6 +314,11 @@ def extract_tickers_with_sentiment(texts):
         for ticker in found_in_text:
             ticker_sentiment[ticker] += sentiment
 
+    if normalized_seen:
+        print(f"  Normalized glued tokens: {normalized_seen}")
+    print(f"  Extraction: {stats['listed']} listed, {stats['normalized']} "
+          f"normalized, {stats['unverified']} unverified cashtags, "
+          f"{stats['dropped']} candidates dropped as not real symbols")
     return ticker_mentions, ticker_sentiment
 
 # ── Score tickers combining frequency and sentiment ───────────────────────────
@@ -205,47 +343,126 @@ def score_tickers(ticker_mentions, ticker_sentiment, earnings_tickers, yahoo_tic
     sorted_tickers = sorted(scores.items(), key=lambda x: x[1]['score'], reverse=True)
     return sorted_tickers[:15]
 
-# ── Filter by market cap ──────────────────────────────────────────────────────
-def filter_by_market_cap(top_tickers, max_cap=500_000_000_000):
-    filtered = []
+# ── Verify finalists against live Yahoo quotes and enrich them ────────────────
+# A symbol with no live price is not a real, traded instrument: it is dropped
+# here even if it slipped through extraction. This is the second gate, and it
+# is also what admits 'unverified' cashtags (real names missing from the
+# listings files) while still rejecting invented ones.
+def fetch_quote(symbol):
+    try:
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
+               f"{_yahoo_symbol(symbol)}")
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        data = r.json()
+        result = (data.get('chart', {}).get('result') or [None])[0]
+        if not result:
+            return None
+        meta = result.get('meta', {})
+        price = meta.get('regularMarketPrice')
+        if not price:
+            return None
+        prev = meta.get('chartPreviousClose') or meta.get('previousClose')
+        day_pct = ((price - prev) / prev * 100) if prev else None
+        return {
+            'price': price,
+            'day_pct': day_pct,
+            'market_cap': meta.get('marketCap') or 0,
+            'instrument': (meta.get('instrumentType') or '').upper(),
+            'name': meta.get('longName') or meta.get('shortName') or '',
+            'volume': meta.get('regularMarketVolume') or 0,
+        }
+    except Exception:
+        return None
+
+def _tidy_name(name):
+    if name and name == name.upper():
+        name = name.title().replace('Corp', 'Corp.').replace(' Inc', ' Inc.')
+    return name
+
+def enrich_and_filter(top_tickers, universe):
+    enriched = []
     for ticker, data in top_tickers:
-        cap = get_market_cap(ticker)
-        if cap == 0 or cap <= max_cap:
-            data['market_cap'] = cap
-            filtered.append((ticker, data))
-            time.sleep(0.3)
-    return filtered[:10]
+        q = fetch_quote(ticker)
+        if q is None:
+            print(f"  Dropped {ticker}: no live quote (not a real, traded symbol)")
+            continue
+        cap = q['market_cap']
+        if cap and cap > MAX_MARKET_CAP:
+            print(f"  Dropped {ticker}: market cap above the $500B screen")
+            continue
+        entry = universe.get(_symbol_key(ticker), {})
+        is_etf = entry.get('is_etf')
+        if is_etf is None:
+            is_etf = q['instrument'] == 'ETF'
+        data = dict(data)
+        data.update({
+            'name': q['name'] or _tidy_name(entry.get('name', '')),
+            'is_etf': bool(is_etf),
+            'price': q['price'],
+            'day_pct': q['day_pct'],
+            'market_cap': cap,
+            'volume': q['volume'],
+        })
+        enriched.append((ticker, data))
+        time.sleep(0.3)
+        if len(enriched) >= 10:
+            break
+    return enriched
+
+# ── Formatting helpers ────────────────────────────────────────────────────────
+def _fmt_cap(cap):
+    if not cap:
+        return '—'
+    if cap >= 1e9:
+        return f"${cap/1e9:.1f}B"
+    return f"${cap/1e6:.0f}M"
+
+def _fmt_price(price):
+    return f"${price:,.2f}" if price else '—'
+
+def _fmt_pct(pct):
+    return f"{pct:+.1f}%" if pct is not None else '—'
+
+def _sentiment_label(score):
+    return 'Bullish' if score > 0 else ('Bearish' if score < 0 else 'Neutral')
 
 # ── Call Claude API to generate report ───────────────────────────────────────
 def generate_report(top_tickers):
     lines = []
     for ticker, data in top_tickers[:10]:
-        sentiment_label = 'Bullish' if data['sentiment'] > 0 else ('Bearish' if data['sentiment'] < 0 else 'Neutral')
+        kind = 'ETF' if data['is_etf'] else 'Stock'
+        name = f" ({data['name']})" if data['name'] else ''
         earnings_flag = ' [EARNINGS TODAY]' if data['has_earnings'] else ''
-        cap_str = f"${data['market_cap']/1e9:.1f}B" if data['market_cap'] > 0 else 'Cap unknown'
         lines.append(
-            f"{ticker}: {data['count']} mentions, sentiment={sentiment_label}, "
-            f"market cap={cap_str}{earnings_flag}"
+            f"{ticker}{name} [{kind}]: {data['count']} mentions, "
+            f"sentiment={_sentiment_label(data['sentiment'])}, "
+            f"last price {_fmt_price(data['price'])} "
+            f"({_fmt_pct(data['day_pct'])} last session), "
+            f"market cap={_fmt_cap(data['market_cap'])}{earnings_flag}"
         )
 
     ticker_summary = '\n'.join(lines)
     today_str = date.today().strftime('%A, %B %d, %Y')
+    valid = {t for t, _ in top_tickers[:10]}
 
     prompt = f"""You are a sharp options trading analyst writing a pre-market briefing for {today_str}.
 
-Social chatter data from Reddit (WSB, options, stocks, pennystocks, Daytrading, investing), Yahoo Finance trending, and Finviz shows these tickers ranked by momentum score. Indexes and ETFs have already been filtered out. All tickers are under $500B market cap.
+Social chatter data from Reddit (WSB, options, stocks, pennystocks, Daytrading, investing), Yahoo Finance trending, and Finviz shows these tickers ranked by momentum score. Major index ETFs are excluded by design. Every symbol below has been validated as a real US-listed stock or ETF with a live market price; all are under the $500B market cap screen where a cap is reported.
 
 {ticker_summary}
 
-Select the TOP 3 picks for options trading today or this week. Weight heavily toward tickers with earnings catalysts, strong bullish sentiment, and high mention counts.
+Select the TOP 3 picks for options trading today or this week. Choose ONLY from the tickers listed above; never invent or substitute a ticker. Weight heavily toward tickers with earnings catalysts, strong bullish sentiment, and high mention counts.
 
-For each pick write:
-TICKER — one line summary of why it's trending
+Write the answer in exactly this format, with no introduction and no extra sections:
+
+PICK: TICKER — one line summary of why it's trending
 CATALYST: what is most likely driving the move
 OPTIONS PLAY: calls or puts, suggested expiry window, and why
 RISK: the single biggest risk to the trade
 
-End with a one-paragraph MARKET PULSE summarizing the overall mood across all tickers today.
+(repeat for each of the 3 picks, separated by a blank line)
+
+MARKET PULSE: one paragraph summarizing the overall mood across all tickers today.
 
 Keep it sharp, punchy, and actionable. No fluff."""
 
@@ -261,71 +478,233 @@ Keep it sharp, punchy, and actionable. No fluff."""
         "content-type": "application/json"
     }
 
+    def _picks_valid(text):
+        picks = re.findall(r'^PICK:\s*\$?([A-Z]{1,6})', text, re.M)
+        return len(picks) >= 1 and all(p in valid for p in picks)
+
     for attempt in range(3):
         try:
             response = requests.post(url, json=payload, headers=api_headers, timeout=30)
             print(f"  Claude status: {response.status_code}")
             response.raise_for_status()
-            return response.json()['content'][0]['text']
+            text = response.json()['content'][0]['text']
+            if _picks_valid(text):
+                return text
+            print("  Claude named a ticker outside the validated list; "
+                  "retrying with a sterner instruction.")
+            payload['messages'] = [{
+                "role": "user",
+                "content": prompt + "\n\nIMPORTANT: your previous draft named a "
+                            "ticker that is not in the list above. Use only "
+                            "listed tickers, exactly as written."
+            }]
         except Exception as e:
             print(f"  Claude attempt {attempt+1} failed: {e}")
             time.sleep(5)
 
-    return "Report generation failed."
+    print("  Falling back to the data-built report.")
+    return template_report(top_tickers)
 
-# ── Build HTML email ──────────────────────────────────────────────────────────
+# ── Deterministic fallback report, built only from validated data ─────────────
+def template_report(top_tickers):
+    blocks = []
+    for ticker, data in top_tickers[:3]:
+        label = _sentiment_label(data['sentiment'])
+        name = data['name'] or ticker
+        kind = 'ETF' if data['is_etf'] else 'stock'
+        if data['has_earnings']:
+            catalyst = (f"{name} reports earnings today, and chatter is "
+                        f"building into the print with {data['count']} mentions.")
+            play_dir = 'calls' if data['sentiment'] >= 0 else 'puts'
+            play = (f"{play_dir.capitalize()} expiring this week or next, "
+                    f"at the money, sized small: the earnings move is the trade.")
+            risk = "Earnings are binary; a miss or soft guidance gaps the name either way."
+        else:
+            catalyst = (f"Sustained social momentum: {data['count']} mentions "
+                        f"across Reddit, Yahoo trending, and Finviz, with "
+                        f"{label.lower()} sentiment. Last price "
+                        f"{_fmt_price(data['price'])} "
+                        f"({_fmt_pct(data['day_pct'])} last session).")
+            play_dir = 'calls' if data['sentiment'] > 0 else (
+                'puts' if data['sentiment'] < 0 else 'calls')
+            play = (f"{play_dir.capitalize()}, one to two week expiry, at the "
+                    f"money, following the {label.lower()} chatter while it lasts.")
+            risk = ("Chatter-driven moves in a " + kind + " reverse quickly "
+                    "when attention moves on; no confirmed news catalyst.")
+        blocks.append(
+            f"PICK: {ticker} — {name} leads the board with {data['count']} "
+            f"mentions and {label.lower()} sentiment.\n"
+            f"CATALYST: {catalyst}\n"
+            f"OPTIONS PLAY: {play}\n"
+            f"RISK: {risk}"
+        )
+
+    labels = [_sentiment_label(d['sentiment']) for _, d in top_tickers[:10]]
+    top_name = top_tickers[0][1]['name'] or top_tickers[0][0] if top_tickers else ''
+    pulse = (
+        f"MARKET PULSE: Chatter is led by {top_name}. Of the ten names on the "
+        f"board, {labels.count('Bullish')} read bullish, "
+        f"{labels.count('Bearish')} bearish, and {labels.count('Neutral')} "
+        f"neutral on social sentiment, with "
+        f"{sum(1 for _, d in top_tickers[:10] if d['has_earnings'])} reporting "
+        f"earnings today."
+    )
+    return '\n\n'.join(blocks + [pulse])
+
+# ── Parse a structured report into picks + market pulse ──────────────────────
+def parse_report(report_text):
+    picks = []
+    blocks = re.split(r'^PICK:\s*', report_text, flags=re.M)
+    for block in blocks[1:]:
+        block = block.strip()
+        if not block:
+            continue
+        head, _, rest = block.partition('\n')
+        m = re.match(r'\$?([A-Z]{1,6}(?:\.[A-Z])?)\s*[—\-:]\s*(.*)', head.strip())
+        if not m:
+            continue
+        pick = {'ticker': m.group(1), 'summary': m.group(2).strip(),
+                'catalyst': '', 'play': '', 'risk': ''}
+        current = None
+        for line in rest.splitlines():
+            if re.match(r'\s*MARKET PULSE\s*:', line):
+                current = None
+                continue
+            lm = re.match(r'\s*(CATALYST|OPTIONS PLAY|RISK)\s*:\s*(.*)', line)
+            if lm:
+                current = {'CATALYST': 'catalyst', 'OPTIONS PLAY': 'play',
+                           'RISK': 'risk'}[lm.group(1)]
+                pick[current] = lm.group(2).strip()
+            elif current and line.strip():
+                pick[current] += ' ' + line.strip()
+        picks.append(pick)
+    pulse_m = re.search(r'MARKET PULSE\s*:\s*(.+)$', report_text, re.S | re.M)
+    pulse = ''
+    if pulse_m:
+        pulse = ' '.join(pulse_m.group(1).split('PICK:')[0].split()).strip()
+    return (picks, pulse) if picks else None
+
+# ── Build the Maineblock-branded HTML email ──────────────────────────────────
+# Brand: Signal Orange #FF8000 on near-black #0B0B0C, warm card surfaces,
+# Space Grotesk headings and Inter body (with email-safe fallbacks), orange
+# eyebrow labels, table layout for the data grid, inline styles throughout.
+import html as _html
+
+def _esc(x):
+    return _html.escape(str(x), quote=True)
+
 def build_html_email(report_text, top_tickers):
     today_str = date.today().strftime('%A, %B %d, %Y')
+    HF = "'Space Grotesk','Segoe UI',Arial,sans-serif"
+    BF = "'Inter','Segoe UI',Arial,sans-serif"
+    INK, MUTED, FAINT = '#FAF6EE', '#A39E93', '#6E675C'
+    BODY, LINE = '#E9E2D4', '#2A251C'
+    UP, DOWN = '#4ADE80', '#F87171'
 
+    # ── Trending table rows ──
     ticker_rows = ''
     for ticker, data in top_tickers[:10]:
         sentiment = data['sentiment']
         if sentiment > 0:
-            sent_color = '#22c55e'
-            sent_label = '▲ Bullish'
+            sent_color, sent_label = UP, '▲ Bullish'
         elif sentiment < 0:
-            sent_color = '#ef4444'
-            sent_label = '▼ Bearish'
+            sent_color, sent_label = DOWN, '▼ Bearish'
         else:
-            sent_color = '#94a3b8'
-            sent_label = '— Neutral'
+            sent_color, sent_label = MUTED, '— Neutral'
 
-        earnings_badge = '<span style="background:#f59e0b;color:#000;padding:2px 6px;border-radius:4px;font-size:11px;margin-left:6px;">EARNINGS</span>' if data['has_earnings'] else ''
-        cap_str = f"${data['market_cap']/1e9:.1f}B" if data['market_cap'] > 0 else '—'
+        badges = ''
+        if data['has_earnings']:
+            badges += ('<span style="background:#FF8000;color:#0B0B0C;'
+                       'padding:2px 6px;border-radius:4px;font-size:10px;'
+                       'font-weight:700;margin-left:6px;">EARNINGS</span>')
+        if data['is_etf']:
+            badges += ('<span style="border:1px solid #FF8000;color:#FF8000;'
+                       'padding:1px 5px;border-radius:4px;font-size:10px;'
+                       'font-weight:700;margin-left:6px;">ETF</span>')
+        name_line = (f'<div style="font-family:{BF};font-size:11px;'
+                     f'color:{MUTED};margin-top:2px;">{_esc(data["name"])}</div>'
+                     if data['name'] else '')
+        day = data['day_pct']
+        day_color = UP if (day or 0) > 0 else (DOWN if (day or 0) < 0 else MUTED)
 
         ticker_rows += f"""
         <tr>
-            <td style="padding:10px 12px;font-weight:700;font-size:15px;color:#f1f5f9;">{ticker}{earnings_badge}</td>
-            <td style="padding:10px 12px;color:#94a3b8;">{data['count']}</td>
-            <td style="padding:10px 12px;color:{sent_color};font-weight:600;">{sent_label}</td>
-            <td style="padding:10px 12px;color:#94a3b8;">{cap_str}</td>
+            <td style="padding:10px 12px;border-bottom:1px solid #241F16;">
+              <span style="font-family:{HF};font-weight:700;font-size:15px;color:{INK};">{_esc(ticker)}</span>{badges}{name_line}
+            </td>
+            <td style="padding:10px 12px;border-bottom:1px solid #241F16;font-family:{BF};font-size:13px;color:{BODY};">{_fmt_price(data['price'])}</td>
+            <td style="padding:10px 12px;border-bottom:1px solid #241F16;font-family:{BF};font-size:13px;font-weight:600;color:{day_color};">{_fmt_pct(day)}</td>
+            <td style="padding:10px 12px;border-bottom:1px solid #241F16;font-family:{BF};font-size:13px;color:{MUTED};">{data['count']}</td>
+            <td style="padding:10px 12px;border-bottom:1px solid #241F16;font-family:{BF};font-size:13px;color:{sent_color};font-weight:600;">{sent_label}</td>
+            <td style="padding:10px 12px;border-bottom:1px solid #241F16;font-family:{BF};font-size:13px;color:{MUTED};">{_fmt_cap(data['market_cap'])}</td>
         </tr>"""
+    if not ticker_rows:
+        ticker_rows = (f'<tr><td colspan="6" style="padding:14px 12px;'
+                       f'font-family:{BF};font-size:13px;color:{MUTED};">'
+                       f'No validated tickers today.</td></tr>')
 
-    report_html = report_text.replace('\n', '<br>')
+    # ── Analysis section: structured pick cards when the report parses ──
+    parsed = parse_report(report_text)
+    if parsed:
+        picks, pulse = parsed
+        cards = ''
+        for i, pick in enumerate(picks[:3], 1):
+            fields = ''
+            for label, key in (('CATALYST', 'catalyst'),
+                               ('OPTIONS PLAY', 'play'),
+                               ('RISK', 'risk')):
+                if pick[key]:
+                    fields += f"""
+            <div style="margin-top:12px;">
+              <div style="font-family:{HF};font-size:11px;font-weight:700;letter-spacing:2px;color:#FF8000;">{label}</div>
+              <div style="font-family:{BF};font-size:14px;line-height:1.7;color:{BODY};margin-top:3px;">{_esc(pick[key])}</div>
+            </div>"""
+            cards += f"""
+  <div style="background:#16130E;border:1px solid {LINE};border-radius:12px;padding:20px 24px;margin-bottom:16px;">
+    <div style="font-family:{HF};font-size:11px;font-weight:700;letter-spacing:2px;color:#FF8000;">PICK {i}</div>
+    <div style="font-family:{HF};font-size:17px;font-weight:700;color:{INK};margin-top:6px;"><span style="color:#FF8000;">{_esc(pick['ticker'])}</span> — {_esc(pick['summary'])}</div>{fields}
+  </div>"""
+        if pulse:
+            cards += f"""
+  <div style="background:#16130E;border:1px solid {LINE};border-left:3px solid #FF8000;border-radius:12px;padding:20px 24px;margin-bottom:20px;">
+    <div style="font-family:{HF};font-size:11px;font-weight:700;letter-spacing:2px;color:#FF8000;">MARKET PULSE</div>
+    <div style="font-family:{BF};font-size:14px;line-height:1.75;color:{BODY};margin-top:8px;">{_esc(pulse)}</div>
+  </div>"""
+        analysis_html = cards
+    else:
+        report_html = _esc(report_text).replace('\n', '<br>')
+        analysis_html = f"""
+  <div style="background:#16130E;border:1px solid {LINE};border-radius:12px;padding:24px 28px;margin-bottom:20px;">
+    <div style="font-family:{BF};font-size:14px;line-height:1.8;color:{BODY};">{report_html}</div>
+  </div>"""
 
-    html = f"""<!DOCTYPE html>
+    top_names = ', '.join(t for t, _ in top_tickers[:3]) or 'No tickers'
+    html_doc = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:'Segoe UI',Arial,sans-serif;">
+<body style="margin:0;padding:0;background:#0B0B0C;font-family:{BF};">
+<div style="display:none;max-height:0;overflow:hidden;">Top chatter today: {_esc(top_names)} — {today_str}</div>
 <div style="max-width:680px;margin:0 auto;padding:24px 16px;">
 
   <!-- Header -->
-  <div style="background:linear-gradient(135deg,#1e3a5f,#0f172a);border-radius:12px;padding:28px 32px;margin-bottom:20px;border:1px solid #1e40af;">
-    <div style="font-size:11px;color:#60a5fa;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Morning Briefing</div>
-    <div style="font-size:26px;font-weight:800;color:#f1f5f9;">📊 Stock Chatter Report</div>
-    <div style="font-size:13px;color:#94a3b8;margin-top:6px;">{today_str}</div>
+  <div style="background:#100D09;border:1px solid {LINE};border-top:3px solid #FF8000;border-radius:12px;padding:28px 32px;margin-bottom:24px;">
+    <div style="font-family:{HF};font-size:11px;font-weight:700;color:#FF8000;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">Maineblock · Morning Briefing</div>
+    <div style="font-family:{HF};font-size:26px;font-weight:700;color:{INK};">Stock Chatter Report</div>
+    <div style="font-family:{BF};font-size:13px;color:{MUTED};margin-top:6px;">{today_str}</div>
   </div>
 
   <!-- Trending Tickers Table -->
-  <div style="background:#1e293b;border-radius:12px;padding:20px 24px;margin-bottom:20px;border:1px solid #334155;">
-    <div style="font-size:13px;font-weight:700;color:#60a5fa;letter-spacing:1px;text-transform:uppercase;margin-bottom:14px;">Top Trending Tickers</div>
+  <div style="font-family:{HF};font-size:12px;font-weight:700;color:#FF8000;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;">Top Trending Tickers</div>
+  <div style="background:#16130E;border:1px solid {LINE};border-radius:12px;padding:12px 12px 16px;margin-bottom:24px;">
     <table style="width:100%;border-collapse:collapse;">
       <thead>
-        <tr style="border-bottom:1px solid #334155;">
-          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#64748b;text-transform:uppercase;">Ticker</th>
-          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#64748b;text-transform:uppercase;">Mentions</th>
-          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#64748b;text-transform:uppercase;">Sentiment</th>
-          <th style="padding:8px 12px;text-align:left;font-size:11px;color:#64748b;text-transform:uppercase;">Mkt Cap</th>
+        <tr>
+          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Ticker</th>
+          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Price</th>
+          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Day</th>
+          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Mentions</th>
+          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Sentiment</th>
+          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Mkt Cap</th>
         </tr>
       </thead>
       <tbody>{ticker_rows}
@@ -334,20 +713,48 @@ def build_html_email(report_text, top_tickers):
   </div>
 
   <!-- AI Analysis -->
-  <div style="background:#1e293b;border-radius:12px;padding:24px 28px;margin-bottom:20px;border:1px solid #334155;">
-    <div style="font-size:13px;font-weight:700;color:#60a5fa;letter-spacing:1px;text-transform:uppercase;margin-bottom:16px;">AI Analysis & Top 3 Picks</div>
-    <div style="font-size:14px;line-height:1.8;color:#cbd5e1;">{report_html}</div>
-  </div>
+  <div style="font-family:{HF};font-size:12px;font-weight:700;color:#FF8000;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;">AI Analysis &amp; Top 3 Picks</div>
+{analysis_html}
 
   <!-- Footer -->
-  <div style="text-align:center;font-size:11px;color:#475569;padding:12px;">
+  <div style="text-align:center;font-family:{BF};font-size:11px;color:{FAINT};padding:12px;">
+    Maineblock · Numbers done right.<br>
     Generated automatically · For informational purposes only · Not financial advice
   </div>
 
 </div>
 </body>
 </html>"""
-    return html
+    return html_doc
+
+# ── Build the plain-text email (mirrors the HTML content) ────────────────────
+def build_text_email(report_text, top_tickers):
+    today_str = date.today().strftime('%A, %B %d, %Y')
+    lines = [
+        'MAINEBLOCK · MORNING BRIEFING',
+        'Stock Chatter Report',
+        today_str,
+        '',
+        'TOP TRENDING TICKERS',
+        f"{'TICKER':<8}{'PRICE':>10}{'DAY':>8}{'MENTIONS':>10}  "
+        f"{'SENTIMENT':<9}{'MKT CAP':>9}",
+    ]
+    for ticker, data in top_tickers[:10]:
+        lines.append(
+            f"{ticker:<8}{_fmt_price(data['price']):>10}"
+            f"{_fmt_pct(data['day_pct']):>8}{data['count']:>10}  "
+            f"{_sentiment_label(data['sentiment']):<9}"
+            f"{_fmt_cap(data['market_cap']):>9}"
+            + ('  [EARNINGS TODAY]' if data['has_earnings'] else '')
+            + ('  [ETF]' if data['is_etf'] else '')
+        )
+    if not top_tickers:
+        lines.append('No validated tickers today.')
+    lines += ['', 'AI ANALYSIS & TOP 3 PICKS', '', report_text, '',
+              'Maineblock · Numbers done right.',
+              'Generated automatically · For informational purposes only · '
+              'Not financial advice']
+    return '\n'.join(lines)
 
 # ── Log results to Google Sheets ──────────────────────────────────────────────
 def log_to_sheets(top_tickers, report_text):
@@ -416,6 +823,9 @@ def send_email(html_content, plain_text):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    print("Loading real-symbol universe...")
+    universe = load_universe()
+
     print("Fetching Reddit posts via RSS...")
     all_texts = []
     for sub in SUBREDDITS:
@@ -423,40 +833,55 @@ def main():
         all_texts.extend(posts)
         time.sleep(2)
 
-    ticker_mentions, ticker_sentiment = extract_tickers_with_sentiment(all_texts)
-    print(f"Unique tickers found: {len(ticker_mentions)}")
+    ticker_mentions, ticker_sentiment = extract_tickers_with_sentiment(all_texts, universe)
+    print(f"Unique validated tickers found: {len(ticker_mentions)}")
 
     print("Fetching Yahoo Finance trending...")
-    yahoo_tickers = fetch_yahoo_trending()
+    yahoo_tickers = fetch_yahoo_trending(universe)
 
     print("Fetching Finviz tickers...")
-    finviz_tickers = fetch_finviz()
+    finviz_tickers = fetch_finviz(universe)
     for t in finviz_tickers:
         ticker_mentions[t] = ticker_mentions.get(t, 0) + 2
 
     print("Fetching earnings calendar...")
-    earnings_tickers = fetch_earnings_this_week()
+    earnings_tickers = fetch_earnings_this_week(universe)
 
     print("Scoring tickers...")
     top_tickers = score_tickers(ticker_mentions, ticker_sentiment, earnings_tickers, yahoo_tickers)
-    print(f"Top before market cap filter: {[t for t,_ in top_tickers[:10]]}")
+    print(f"Top before quote verification: {[t for t,_ in top_tickers[:10]]}")
 
-    print("Filtering by market cap...")
-    top_tickers = filter_by_market_cap(top_tickers)
-    print(f"Top after market cap filter: {[t for t,_ in top_tickers[:5]]}")
+    print("Verifying quotes and enriching...")
+    top_tickers = enrich_and_filter(top_tickers, universe)
+    print(f"Final validated board: {[t for t,_ in top_tickers[:10]]}")
 
-    print("Generating report with Claude...")
-    report = generate_report(top_tickers)
+    if top_tickers:
+        print("Generating report with Claude...")
+        report = generate_report(top_tickers)
+    else:
+        report = ("No tickers cleared validation today. Every candidate symbol "
+                  "was checked against the exchange listings and live quotes, "
+                  "and none met the mention threshold with a verified price.")
     print(report)
 
-    print("Building HTML email...")
+    print("Building emails...")
     html = build_html_email(report, top_tickers)
+    text = build_text_email(report, top_tickers)
+
+    if DRY_RUN:
+        with open('report_preview.html', 'w') as f:
+            f.write(html)
+        with open('report_preview.txt', 'w') as f:
+            f.write(text)
+        print("DRY RUN: wrote report_preview.html and report_preview.txt; "
+              "no email sent, nothing logged.")
+        return
 
     print("Logging to Google Sheets...")
     log_to_sheets(top_tickers, report)
 
     print("Sending email...")
-    send_email(html, report)
+    send_email(html, text)
     print("Done.")
 
 if __name__ == "__main__":
