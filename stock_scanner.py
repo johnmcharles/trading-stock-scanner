@@ -91,8 +91,6 @@ SEC_HEADERS = {
     'User-Agent': 'Maineblock morning scanner (admin@maineblock.com)'
 }
 
-MAX_MARKET_CAP = 500_000_000_000
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Real-symbol universe: the validation gate that keeps fake tickers out.
 # Built each run from the official exchange listings (Nasdaq Trader symbol
@@ -328,26 +326,29 @@ def extract_tickers_with_sentiment(texts, universe):
     return ticker_mentions, ticker_sentiment
 
 # ── Score tickers combining frequency and sentiment ───────────────────────────
+# Returns (primary, backfill). Primary is the ranked board pool: tickers with
+# at least 3 mentions, best first. Backfill holds the tickers below the
+# mention line, ranked the same way, so the board can still be completed to
+# ten names on a thin day. Both pools carry only validated symbols, and every
+# entry still has to pass the live-quote gate before it can appear.
 def score_tickers(ticker_mentions, ticker_sentiment, earnings_tickers, yahoo_tickers):
-    scores = {}
+    primary, backfill = {}, {}
     for ticker, count in ticker_mentions.items():
-        if count < 3:
-            continue
         score = count
         if ticker in earnings_tickers:
             score *= 2.0
         if ticker in yahoo_tickers:
             score *= 1.5
-        sentiment = ticker_sentiment.get(ticker, 0)
-        scores[ticker] = {
+        entry = {
             'count': count,
-            'sentiment': sentiment,
+            'sentiment': ticker_sentiment.get(ticker, 0),
             'score': score,
             'has_earnings': ticker in earnings_tickers
         }
+        (primary if count >= 3 else backfill)[ticker] = entry
 
-    sorted_tickers = sorted(scores.items(), key=lambda x: x[1]['score'], reverse=True)
-    return sorted_tickers[:15]
+    rank = lambda pool: sorted(pool.items(), key=lambda x: x[1]['score'], reverse=True)
+    return rank(primary)[:15], rank(backfill)[:15]
 
 # ── Verify finalists against live Yahoo quotes and enrich them ────────────────
 # A symbol with no live price is not a real, traded instrument: it is dropped
@@ -372,7 +373,7 @@ def fetch_quote(symbol):
         return {
             'price': price,
             'day_pct': day_pct,
-            'market_cap': meta.get('marketCap') or 0,
+            'market_cap': 0,  # the chart endpoint has no cap field; see fetch_market_caps
             'instrument': (meta.get('instrumentType') or '').upper(),
             'name': meta.get('longName') or meta.get('shortName') or '',
             'volume': meta.get('regularMarketVolume') or 0,
@@ -380,22 +381,48 @@ def fetch_quote(symbol):
     except Exception:
         return None
 
+# ── Market caps, fetched in one batch from the quote endpoint ────────────────
+# The chart endpoint above returns no marketCap field, which is why the MKT
+# CAP column used to render empty. Caps come from the v7 quote endpoint,
+# which needs Yahoo's cookie/crumb handshake. Any failure returns an empty
+# map; the affected rows simply render a dash, and a cap never gates a ticker.
+def fetch_market_caps(symbols):
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        session.get('https://fc.yahoo.com', timeout=10)
+        crumb = session.get(
+            'https://query2.finance.yahoo.com/v1/test/getcrumb',
+            timeout=10).text.strip()
+        if not crumb or '<' in crumb:
+            return {}
+        yahoo_syms = [_yahoo_symbol(s) for s in symbols]
+        r = session.get(
+            'https://query2.finance.yahoo.com/v7/finance/quote',
+            params={'symbols': ','.join(yahoo_syms), 'crumb': crumb},
+            timeout=15)
+        caps = {}
+        for q in r.json().get('quoteResponse', {}).get('result', []):
+            cap = q.get('marketCap')
+            if cap:
+                caps[(q.get('symbol') or '').upper()] = cap
+        return caps
+    except Exception:
+        return {}
+
 def _tidy_name(name):
     if name and name == name.upper():
         name = name.title().replace('Corp', 'Corp.').replace(' Inc', ' Inc.')
     return name
 
-def enrich_and_filter(top_tickers, universe):
+def enrich_and_filter(top_tickers, universe, backfill=()):
     enriched = []
-    for ticker, data in top_tickers:
+
+    def consider(ticker, data, from_backfill):
         q = fetch_quote(ticker)
         if q is None:
             print(f"  Dropped {ticker}: no live quote (not a real, traded symbol)")
-            continue
-        cap = q['market_cap']
-        if cap and cap > MAX_MARKET_CAP:
-            print(f"  Dropped {ticker}: market cap above the $500B screen")
-            continue
+            return
         entry = universe.get(_symbol_key(ticker), {})
         is_etf = entry.get('is_etf')
         if is_etf is None:
@@ -406,19 +433,42 @@ def enrich_and_filter(top_tickers, universe):
             'is_etf': bool(is_etf),
             'price': q['price'],
             'day_pct': q['day_pct'],
-            'market_cap': cap,
+            'market_cap': 0,
             'volume': q['volume'],
         })
         enriched.append((ticker, data))
+        if from_backfill:
+            print(f"  Backfilled {ticker} ({data['count']} mentions) "
+                  f"to complete the board of ten")
         time.sleep(0.3)
+
+    # There is deliberately no market-cap screen: the board's leaders are
+    # routinely mega-caps, and a cap reading says nothing about whether a
+    # symbol is real. Reality is enforced by the listings universe and the
+    # live-quote gate. (The old $500B drop never fired in practice, because
+    # the chart endpoint supplied no cap to test.)
+    for ticker, data in top_tickers:
         if len(enriched) >= 10:
             break
+        consider(ticker, data, False)
+    if len(enriched) < 10:
+        for ticker, data in backfill:
+            if len(enriched) >= 10:
+                break
+            consider(ticker, data, True)
+
+    if enriched:
+        caps = fetch_market_caps([t for t, _ in enriched])
+        for ticker, data in enriched:
+            data['market_cap'] = caps.get(_yahoo_symbol(ticker).upper(), 0)
     return enriched
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
 def _fmt_cap(cap):
     if not cap:
         return '—'
+    if cap >= 1e12:
+        return f"${cap/1e12:.2f}T"
     if cap >= 1e9:
         return f"${cap/1e9:.1f}B"
     return f"${cap/1e6:.0f}M"
@@ -548,7 +598,7 @@ def template_report(top_tickers):
     labels = [_sentiment_label(d['sentiment']) for _, d in top_tickers[:10]]
     top_name = top_tickers[0][1]['name'] or top_tickers[0][0] if top_tickers else ''
     pulse = (
-        f"MARKET PULSE: Chatter is led by {top_name}. Of the ten names on the "
+        f"MARKET PULSE: Chatter is led by {top_name}. Of the {len(top_tickers)} names on the "
         f"board, {labels.count('Bullish')} read bullish, "
         f"{labels.count('Bearish')} bearish, and {labels.count('Neutral')} "
         f"neutral on social sentiment, with "
@@ -880,11 +930,13 @@ def main():
     earnings_tickers = fetch_earnings_this_week(universe)
 
     print("Scoring tickers...")
-    top_tickers = score_tickers(ticker_mentions, ticker_sentiment, earnings_tickers, yahoo_tickers)
+    top_tickers, backfill = score_tickers(ticker_mentions, ticker_sentiment, earnings_tickers, yahoo_tickers)
     print(f"Top before quote verification: {[t for t,_ in top_tickers[:10]]}")
+    if backfill:
+        print(f"Backfill pool (below the 3-mention line): {[t for t,_ in backfill]}")
 
     print("Verifying quotes and enriching...")
-    top_tickers = enrich_and_filter(top_tickers, universe)
+    top_tickers = enrich_and_filter(top_tickers, universe, backfill)
     print(f"Final validated board: {[t for t,_ in top_tickers[:10]]}")
 
     if top_tickers:
@@ -893,7 +945,7 @@ def main():
     else:
         report = ("No tickers cleared validation today. Every candidate symbol "
                   "was checked against the exchange listings and live quotes, "
-                  "and none met the mention threshold with a verified price.")
+                  "and none carried a verified live price.")
     print(report)
 
     print("Building emails...")
