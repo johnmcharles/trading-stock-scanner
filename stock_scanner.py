@@ -685,14 +685,14 @@ def build_html_email(report_text, top_tickers):
 
         ticker_rows += f"""
         <tr>
-            <td style="padding:10px 12px;border-bottom:1px solid #241F16;">
-              <span style="font-family:{HF};font-weight:700;font-size:15px;color:{INK};">{_esc(ticker)}</span>{badges}{name_line}
+            <td style="padding:10px 6px;border-bottom:1px solid #241F16;word-wrap:break-word;overflow-wrap:break-word;">
+              <span style="font-family:{HF};font-weight:700;font-size:14px;color:{INK};">{_esc(ticker)}</span>{badges}{name_line}
             </td>
-            <td style="padding:10px 12px;border-bottom:1px solid #241F16;font-family:{BF};font-size:13px;color:{BODY};">{_fmt_price(data['price'])}</td>
-            <td style="padding:10px 12px;border-bottom:1px solid #241F16;font-family:{BF};font-size:13px;font-weight:600;color:{day_color};">{_fmt_pct(day)}</td>
-            <td style="padding:10px 12px;border-bottom:1px solid #241F16;font-family:{BF};font-size:13px;color:{MUTED};">{data['count']}</td>
-            <td style="padding:10px 12px;border-bottom:1px solid #241F16;font-family:{BF};font-size:13px;color:{sent_color};font-weight:600;">{sent_label}</td>
-            <td style="padding:10px 12px;border-bottom:1px solid #241F16;font-family:{BF};font-size:13px;color:{MUTED};">{_fmt_cap(data['market_cap'])}</td>
+            <td style="padding:10px 6px;border-bottom:1px solid #241F16;font-family:{BF};font-size:12px;color:{BODY};white-space:nowrap;">{_fmt_price(data['price'])}</td>
+            <td style="padding:10px 6px;border-bottom:1px solid #241F16;font-family:{BF};font-size:12px;font-weight:600;color:{day_color};white-space:nowrap;">{_fmt_pct(day)}</td>
+            <td class="col-mentions" style="padding:10px 6px;border-bottom:1px solid #241F16;font-family:{BF};font-size:12px;color:{MUTED};">{data['count']}</td>
+            <td style="padding:10px 6px;border-bottom:1px solid #241F16;font-family:{BF};font-size:12px;color:{sent_color};font-weight:600;">{sent_label}</td>
+            <td style="padding:10px 6px;border-bottom:1px solid #241F16;font-family:{BF};font-size:12px;color:{MUTED};white-space:nowrap;">{_fmt_cap(data['market_cap'])}</td>
         </tr>"""
     if not ticker_rows:
         ticker_rows = (f'<tr><td colspan="6" style="padding:14px 12px;'
@@ -737,7 +737,13 @@ def build_html_email(report_text, top_tickers):
     top_names = ', '.join(t for t, _ in top_tickers[:3]) or 'No tickers'
     html_doc = f"""<!DOCTYPE html>
 <html>
-<head><meta charset="UTF-8"></head>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+@media only screen and (max-width:480px){{
+  .col-mentions{{display:none !important;}}
+  table{{table-layout:auto !important;}}
+}}
+</style></head>
 <body style="margin:0;padding:0;background:#0B0B0C;font-family:{BF};">
 <div style="display:none;max-height:0;overflow:hidden;">Top chatter today: {_esc(top_names)} — {today_str}</div>
 <div style="max-width:680px;margin:0 auto;padding:24px 16px;">
@@ -751,16 +757,19 @@ def build_html_email(report_text, top_tickers):
 
   <!-- Trending Tickers Table -->
   <div style="font-family:{HF};font-size:12px;font-weight:700;color:#FF8000;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;">Top Trending Tickers</div>
-  <div style="background:#16130E;border:1px solid {LINE};border-radius:12px;padding:12px 12px 16px;margin-bottom:24px;">
-    <table style="width:100%;border-collapse:collapse;">
+  <div style="background:#16130E;border:1px solid {LINE};border-radius:12px;padding:12px 6px 16px;margin-bottom:24px;">
+    <table style="width:100%;border-collapse:collapse;table-layout:fixed;">
+      <colgroup>
+        <col style="width:25%;"><col style="width:16%;"><col style="width:12%;"><col style="width:11%;"><col style="width:20%;"><col style="width:16%;">
+      </colgroup>
       <thead>
         <tr>
-          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Ticker</th>
-          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Price</th>
-          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Day</th>
-          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Mentions</th>
-          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Sentiment</th>
-          <th style="padding:8px 12px;text-align:left;font-family:{HF};font-size:11px;color:#8A8378;text-transform:uppercase;letter-spacing:1px;">Mkt Cap</th>
+          <th style="padding:8px 6px;text-align:left;font-family:{HF};font-size:10px;color:#8A8378;text-transform:uppercase;letter-spacing:0.5px;">Ticker</th>
+          <th style="padding:8px 6px;text-align:left;font-family:{HF};font-size:10px;color:#8A8378;text-transform:uppercase;letter-spacing:0.5px;">Price</th>
+          <th style="padding:8px 6px;text-align:left;font-family:{HF};font-size:10px;color:#8A8378;text-transform:uppercase;letter-spacing:0.5px;">Day</th>
+          <th class="col-mentions" style="padding:8px 6px;text-align:left;font-family:{HF};font-size:10px;color:#8A8378;text-transform:uppercase;letter-spacing:0.5px;">Mentions</th>
+          <th style="padding:8px 6px;text-align:left;font-family:{HF};font-size:10px;color:#8A8378;text-transform:uppercase;letter-spacing:0.5px;">Sentiment</th>
+          <th style="padding:8px 6px;text-align:left;font-family:{HF};font-size:10px;color:#8A8378;text-transform:uppercase;letter-spacing:0.5px;">Mkt Cap</th>
         </tr>
       </thead>
       <tbody>{ticker_rows}
